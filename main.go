@@ -6,14 +6,22 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"sync"
 
 	"github.com/antonmedv/expr"
 	"github.com/davecgh/go-spew/spew"
+	"github.com/jinzhu/copier"
 )
 
 type World struct {
 	Resources map[string]int
 	Powers    map[string]int
+}
+
+func (w World) Copy() World {
+	copy := World{}
+	copier.Copy(&copy, &w)
+	return copy
 }
 
 type Delta []float64
@@ -133,18 +141,69 @@ func (s Scenario) Decisions(r Rand) DecisionsF {
 	}
 }
 
-func (w *World) Apply(choice Choice) (World, error) {
+func (w *World) Apply(choice Choice) error {
 	for resource, delta := range choice.Change.Resources {
 		w.Resources[resource] = updatedValue(w.Resources[resource], delta)
 	}
 	for power, delta := range choice.Change.Powers {
 		w.Powers[power] = updatedValue(w.Powers[power], delta)
 	}
-	return *w, nil
+	return nil
 }
 
 func updatedValue(old int, delta Delta) int {
 	return int(math.Round(delta[0]*float64(old) + delta[1]))
+}
+
+func gameLoop(scenario Scenario, choiceCh <-chan Choice) (<-chan []Decision, <-chan World, error) {
+	world := World{
+		Resources: map[string]int{
+			"Money": 4000,
+		},
+		Powers: map[string]int{
+			"Military":    90,
+			"Legislation": 10,
+		},
+	}
+
+	decisionCh := make(chan []Decision)
+	worldCh := make(chan World)
+
+	go func() {
+		defer close(decisionCh)
+		defer close(worldCh)
+
+		r := rand.New(rand.NewSource(0))
+		for {
+			fmt.Println("ITERATION")
+			worldCh <- world
+
+			decisions, err := scenario.Decisions(r)(world, 3)
+			if err != nil {
+				log.Fatalf("Error getting decisions: %v", err)
+			}
+			if len(decisions) == 0 {
+				// TODO: We need to figure out how to solve this; the game can get stuck.
+				// So simple continue won't be enough.
+				return
+			}
+
+			decisionCh <- decisions
+
+			choice, ok := <-choiceCh
+			if !ok {
+				return
+			}
+			spew.Dump(choice)
+			err = world.Apply(choice)
+			if err != nil {
+				log.Printf("Error applying choice %v to world: %v", choice.Description, err)
+				return
+			}
+		}
+	}()
+
+	return decisionCh, worldCh, nil
 }
 
 func main() {
@@ -182,31 +241,51 @@ func main() {
 		Rules: []Rule{rule},
 	}
 
-	world := World{
-		Resources: map[string]int{
-			"Money": 4000,
-		},
-		Powers: map[string]int{
-			"Military":    90,
-			"Legislation": 10,
-		},
-	}
-
-	r := rand.New(rand.NewSource(0))
-	decisions, err := scenario.Decisions(r)(world, 1)
+	choiceCh := make(chan Choice)
+	decisionCh, worldCh, err := gameLoop(scenario, choiceCh)
 	if err != nil {
-		log.Fatalf("Error getting decisions: %v", err)
+		log.Fatalf("Error starting game loop: %v", err)
 	}
 
-	for _, decision := range decisions {
-		fmt.Println(decision.Description)
-	}
+	wait := sync.WaitGroup{}
 
-	spew.Dump(world)
-	if len(decisions) > 0 {
-		world.Apply(decisions[0].Choices[0])
-	}
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		for world := range worldCh {
+			fmt.Println("WORLD!")
+			spew.Dump(world)
+		}
+	}()
 
-	spew.Dump(world)
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		for decisions := range decisionCh {
+			spew.Dump(decisions)
+			choiceCh <- decisions[0].Choices[0]
+		}
+	}()
+
+	wait.Wait()
+	close(choiceCh)
+
+	// button := tui.NewButton("[Quit]")
+
+	// root := tui.NewVBox(tui.NewVBox(
+	// 	button))
+	// ui, err := tui.New(root)
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// ui.SetKeybinding("Esc", func() { ui.Quit() })
+
+	// button.OnActivated(func(b *tui.Button) {
+	// 	ui.Quit()
+	// })
+	// button.SetFocused(true)
+	// if err := ui.Run(); err != nil {
+	// 	log.Fatal(err)
+	// }
 
 }
