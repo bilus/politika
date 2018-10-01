@@ -6,11 +6,13 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/antonmedv/expr"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/jinzhu/copier"
+	tui "github.com/marcusolsson/tui-go"
 )
 
 type World struct {
@@ -175,7 +177,6 @@ func gameLoop(scenario Scenario, choiceCh <-chan Choice) (<-chan []Decision, <-c
 
 		r := rand.New(rand.NewSource(0))
 		for {
-			fmt.Println("ITERATION")
 			worldCh <- world
 
 			decisions, err := scenario.Decisions(r)(world, 3)
@@ -194,7 +195,6 @@ func gameLoop(scenario Scenario, choiceCh <-chan Choice) (<-chan []Decision, <-c
 			if !ok {
 				return
 			}
-			spew.Dump(choice)
 			err = world.Apply(choice)
 			if err != nil {
 				log.Printf("Error applying choice %v to world: %v", choice.Description, err)
@@ -207,13 +207,13 @@ func gameLoop(scenario Scenario, choiceCh <-chan Choice) (<-chan []Decision, <-c
 }
 
 func main() {
-	rule, err := NewRule(
+	rule1, err := NewRule(
 		"World.Resources.Money > 1000 and World.Powers.Military >= 90",
 		1.0,
 		Decision{"Make putsch",
 			[]Choice{
 				{
-					Description: "Yes",
+					Description: "Accept",
 					Change: Change{
 						Resources: map[string]Delta{
 							"Money":      Delta{0.5, 0},
@@ -224,6 +224,7 @@ func main() {
 						},
 					},
 				}, {
+					Description: "Reject",
 					Change: Change{
 						Powers: map[string]Delta{
 							"Military": Delta{0.1, 0},
@@ -233,12 +234,21 @@ func main() {
 			},
 		},
 	)
+	rule2, err := NewRule(
+		"true",
+		1.0,
+		Decision{"Quit",
+			[]Choice{
+				{
+					Description: "Accept",
+				},
+			}})
 	if err != nil {
 		log.Fatalf("Error parsing expression: %v", err)
 	}
 
 	scenario := Scenario{
-		Rules: []Rule{rule},
+		Rules: []Rule{rule1, rule2},
 	}
 
 	choiceCh := make(chan Choice)
@@ -247,45 +257,98 @@ func main() {
 		log.Fatalf("Error starting game loop: %v", err)
 	}
 
+	consoleUI(decisionCh, worldCh, choiceCh)
+}
+
+func consoleUI(decisionCh <-chan []Decision, worldCh <-chan World, choiceCh chan<- Choice) {
+	debugWindow := tui.NewLabel("")
+	choiceTable := tui.NewTable(0, 0)
+	powerStatus := tui.NewStatusBar("")
+	resourceStatus := tui.NewStatusBar("")
+	root := tui.NewVBox(
+		tui.NewHBox(
+			tui.NewVBox(
+				choiceTable,
+				tui.NewSpacer(),
+			),
+			debugWindow),
+		tui.NewSpacer(),
+		tui.NewHBox(
+			tui.NewVBox(
+				resourceStatus,
+				powerStatus,
+			),
+			tui.NewVBox(
+				tui.NewSpacer(),
+				tui.NewHBox(
+					tui.NewSpacer(),
+					tui.NewLabel("ESC to quit"),
+				),
+			),
+		),
+	)
+
+	choiceTable.SetFocused(true)
+	ui, err := tui.New(root)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	wait := sync.WaitGroup{}
 
 	wait.Add(1)
 	go func() {
 		defer wait.Done()
 		for world := range worldCh {
-			fmt.Println("WORLD!")
-			spew.Dump(world)
+			ui.Update(func() {
+				powers := make([]string, 0)
+				for k, v := range world.Powers {
+					powers = append(powers, fmt.Sprintf("%v: %v", k, v))
+				}
+				powerStatus.SetText(strings.Join(powers, " "))
+				resources := make([]string, 0)
+				for k, v := range world.Resources {
+					resources = append(resources, fmt.Sprintf("%v: %v", k, v))
+				}
+				resourceStatus.SetText(strings.Join(resources, " "))
+			})
 		}
 	}()
 
 	wait.Add(1)
 	go func() {
 		defer wait.Done()
+
 		for decisions := range decisionCh {
-			spew.Dump(decisions)
-			choiceCh <- decisions[0].Choices[0]
+			ui.Update(func() {
+				debugWindow.SetText(spew.Sdump(decisions))
+				choiceTable.RemoveRows()
+
+				choices := make([]Choice, 0)
+
+				for _, decision := range decisions {
+					label := tui.NewLabel(decision.Description)
+					for _, choice := range decision.Choices {
+						choiceBtn := tui.NewLabel(choice.Description)
+						choiceTable.AppendRow(label, choiceBtn)
+						choices = append(choices, choice)
+					}
+				}
+
+				choiceTable.OnItemActivated(func(t *tui.Table) {
+					if t.Selected() >= 0 && t.Selected() < len(choices) {
+						choiceCh <- choices[t.Selected()]
+					}
+				})
+			})
 		}
 	}()
 
+	ui.SetKeybinding("Esc", func() { close(choiceCh); ui.Quit() })
+
+	if err := ui.Run(); err != nil {
+		log.Fatal(err)
+	}
+
 	wait.Wait()
-	close(choiceCh)
-
-	// button := tui.NewButton("[Quit]")
-
-	// root := tui.NewVBox(tui.NewVBox(
-	// 	button))
-	// ui, err := tui.New(root)
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	// ui.SetKeybinding("Esc", func() { ui.Quit() })
-
-	// button.OnActivated(func(b *tui.Button) {
-	// 	ui.Quit()
-	// })
-	// button.SetFocused(true)
-	// if err := ui.Run(); err != nil {
-	// 	log.Fatal(err)
-	// }
-
 }
